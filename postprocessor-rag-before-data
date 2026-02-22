@@ -1,0 +1,182 @@
+import streamlit as st
+import duckdb
+import chromadb
+import json
+import os
+from openai import OpenAI
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+ARTIFACTS_DIR = "deploy_artifacts"
+PARQUET_FILE = os.path.join(ARTIFACTS_DIR, "data.parquet")
+METADATA_FILE = os.path.join(ARTIFACTS_DIR, "metadata.json")
+CHROMA_PATH = os.path.join(ARTIFACTS_DIR, "chroma_db")
+
+# Page Config
+st.set_page_config(page_title="Large Data RAG PoC", layout="wide")
+
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
+@st.cache_resource
+def load_resources():
+    """
+    Loads connections once to save resources.
+    """
+    if not os.path.exists(PARQUET_FILE):
+        return None, None, None
+
+    # 1. Load Metadata
+    with open(METADATA_FILE, "r") as f:
+        metadata = json.load(f)
+
+    # 2. Connect to ChromaDB
+    chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+    collection = chroma_client.get_collection("dataset_schema")
+
+    # 3. DuckDB Connection (Read-only for safety)
+    # We don't load data; we just point to the Parquet file
+    conn = duckdb.connect(database=':memory:', read_only=False)
+    
+    return metadata, collection, conn
+
+def generate_sql_query(question, context, metadata, client_openai):
+    """
+    Uses the LLM to generate a DuckDB SQL query based on the question and schema context.
+    """
+    system_prompt = f"""
+    You are an expert Data Scientist. You are working with a single table.
+    
+    IMPORTANT: You must query the parquet file directly using this syntax:
+    SELECT ... FROM '{PARQUET_FILE}' ...
+    
+    The dataset has {metadata['total_rows']} rows.
+    
+    Here is the schema information relevant to the user's question:
+    {context}
+    
+    Rules:
+    1. Return ONLY the SQL query. No markdown, no explanations.
+    2. Use DuckDB dialect (e.g. date_part('year', date_col) instead of YEAR(date_col)).
+    3. If the user asks for a specific text match, use ILIKE for case insensitivity.
+    4. Limit results to 50 unless specified otherwise.
+    """
+    
+    response = client_openai.chat.completions.create(
+        model="gpt-3.5-turbo", # Use gpt-4-turbo for better SQL generation
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question}
+        ],
+        temperature=0
+    )
+    return response.choices[0].message.content.strip().replace("```sql", "").replace("```", "")
+
+def summarize_results(question, df, client_openai):
+    """
+    Summarizes the dataframe results back to the user in natural language.
+    """
+    data_csv = df.to_csv(index=False)
+    
+    response = client_openai.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You are a helpful analyst. Summarize the data results to answer the user's question concisely."},
+            {"role": "user", "content": f"Question: {question}\n\nData Results:\n{data_csv}"}
+        ]
+    )
+    return response.choices[0].message.content
+
+# ==========================================
+# MAIN APP UI
+# ==========================================
+st.title("📊 RAG over Large Datasets (PoC)")
+
+# Sidebar: Instructions & API Key
+with st.sidebar:
+    st.header("Configuration")
+    api_key = st.text_input("OpenAI API Key", type="password")
+    
+    st.markdown("---")
+    st.markdown("""
+    **How this works:**
+    1. **Local Preprocessing:** We converted a large CSV to Parquet and extracted schema embeddings locally.
+    2. **Vector Search:** We find the columns relevant to your question.
+    3. **SQL Generation:** The LLM writes a SQL query targeting the Parquet file.
+    4. **Execution:** DuckDB executes the query (without loading the full file to RAM).
+    """)
+
+# Check for artifacts
+metadata, collection, conn = load_resources()
+
+if not metadata:
+    st.error(f"Artifacts not found! Did you run `preprocess.py`? Looking in: {ARTIFACTS_DIR}")
+    st.stop()
+
+if not api_key:
+    st.warning("Please enter your OpenAI API Key in the sidebar to continue.")
+    st.stop()
+
+# Initialize OpenAI
+client_openai = OpenAI(api_key=api_key)
+
+# Initialize Chat History
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Display Chat History
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# Chat Input
+if prompt := st.chat_input("Ask a question about your data..."):
+    # 1. User Message
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    # 2. RAG Logic
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+        
+        try:
+            with st.status("Thinking...", expanded=True) as status:
+                
+                # A. Retrieve Context (Schema RAG)
+                status.write("🔍 Searching dataset schema...")
+                results = collection.query(
+                    query_texts=[prompt],
+                    n_results=5 # Get top 5 most relevant columns
+                )
+                context_text = "\n".join(results['documents'][0])
+                
+                # B. Generate SQL
+                status.write("📝 Generating SQL query...")
+                sql_query = generate_sql_query(prompt, context_text, metadata, client_openai)
+                st.code(sql_query, language="sql") # Show the user the SQL (Transparency)
+                
+                # C. Execute SQL (DuckDB)
+                status.write("⚡ Executing query on Parquet file...")
+                try:
+                    df = conn.execute(sql_query).df()
+                    st.dataframe(df) # Show the raw data table
+                    
+                    # D. Synthesize Answer
+                    if not df.empty:
+                        status.write("🧠 Summarizing results...")
+                        final_answer = summarize_results(prompt, df, client_openai)
+                    else:
+                        final_answer = " The query returned no results."
+                        
+                except Exception as e:
+                    final_answer = f"I generated a query, but it failed to run. Error: {str(e)}"
+                    status.update(state="error")
+
+            # Output Final Answer
+            message_placeholder.markdown(final_answer)
+            st.session_state.messages.append({"role": "assistant", "content": final_answer})
+
+        except Exception as e:
+            st.error(f"An error occurred: {str(e)}")
