@@ -3,7 +3,19 @@
 # # requirements.txt streamlit pandas duckdb openai chromadb sentence-transformers pyarrow
 # run command:
 #                             streamlit run preprocess.py
-#                  directory setup: cd C:\Users\oakhtar\OneDrive - D2L Corporation\Documents\pyprojs_local
+#                  directory setup: cd "C:\Users\oakhtar\OneDrive - D2L Corporation\Documents\pyprojs_local"
+# ==========================================
+# SETUP INSTRUCTIONS (Run in PowerShell)
+# ==========================================
+# 1. Create the environment
+# py -3.11 -m venv venv
+#
+# 2. Activate it
+# .\venv\Scripts\activate
+#
+# 3. Re-install libraries (since it's a fresh environment)
+# pip install streamlit duckdb pandas chromadb sentence-transformers openai pyarrow
+# ==========================================
 
 import streamlit as st
 import duckdb
