@@ -52,22 +52,32 @@ def process_data(uploaded_file):
 
     try:
         # 1. SAVE TEMP FILE
-        # DuckDB prefers file paths over memory buffers for large files
         status_container.write("💾 Saving temporary file to disk...")
         with open(TEMP_CSV_PATH, "wb") as f:
             f.write(uploaded_file.getbuffer())
         
         conn = duckdb.connect()
 
-        # 2. CONVERT TO PARQUET
+        # 2. CONVERT TO PARQUET (With Encoding Fallback)
         status_container.write("📦 Converting CSV to optimized Parquet format...")
         parquet_path = os.path.join(ARTIFACTS_DIR, "data.parquet")
         
-        # We sample 20k rows to infer types, then write the whole file
-        conn.execute(f"""
-            COPY (SELECT * FROM read_csv_auto('{TEMP_CSV_PATH}', sample_size=20000)) 
-            TO '{parquet_path}' (FORMAT 'PARQUET', CODEC 'ZSTD')
-        """)
+        # Try UTF-8 First (Standard)
+        try:
+            conn.execute(f"""
+                COPY (SELECT * FROM read_csv_auto('{TEMP_CSV_PATH}', sample_size=20000)) 
+                TO '{parquet_path}' (FORMAT 'PARQUET', CODEC 'ZSTD')
+            """)
+        except Exception as e:
+            if "Invalid Input Error" in str(e) or "unicode" in str(e).lower():
+                status_container.write("⚠️ UTF-8 failed. Retrying with Latin-1 encoding (Excel default)...")
+                # Retry with Latin-1 encoding and ignore_errors as a safety net
+                conn.execute(f"""
+                    COPY (SELECT * FROM read_csv_auto('{TEMP_CSV_PATH}', sample_size=20000, encoding='latin-1', ignore_errors=true)) 
+                    TO '{parquet_path}' (FORMAT 'PARQUET', CODEC 'ZSTD')
+                """)
+            else:
+                raise e
 
         # 3. EXTRACT METADATA
         status_container.write("🔍 Extracting schema and statistics...")
@@ -83,8 +93,9 @@ def process_data(uploaded_file):
             col_type = row['column_type']
             
             # Get sample values for context (crucial for LLM)
+            # We explicitly cast to VARCHAR to avoid type errors during sampling
             sample_vals = conn.execute(f"""
-                SELECT "{col_name}" FROM '{parquet_path}' 
+                SELECT "{col_name}"::VARCHAR FROM '{parquet_path}' 
                 WHERE "{col_name}" IS NOT NULL LIMIT 3
             """).fetchall()
             samples = [str(x[0]) for x in sample_vals]
@@ -128,7 +139,10 @@ def process_data(uploaded_file):
         )
 
         # Cleanup
-        os.remove(TEMP_CSV_PATH)
+        conn.close()
+        if os.path.exists(TEMP_CSV_PATH):
+            os.remove(TEMP_CSV_PATH)
+            
         status_container.update(label="✅ Processing Complete!", state="complete", expanded=False)
         
         st.success(f"Success! Artifacts saved to `/{ARTIFACTS_DIR}`")
