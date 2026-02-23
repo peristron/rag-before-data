@@ -25,13 +25,9 @@ TEMP_CSV_PATH = "temp_upload.csv"
 st.set_page_config(page_title="🛠️ Data Preprocessor", layout="centered")
 
 # ==========================================
-# WINDOWS FILE SYSTEM HELPERS
+# FILE SYSTEM HELPERS
 # ==========================================
 def remove_readonly(func, path, excinfo):
-    """
-    Helper to force delete read-only files on Windows.
-    Used by shutil.rmtree's onerror handler.
-    """
     try:
         os.chmod(path, stat.S_IWRITE)
         func(path)
@@ -39,35 +35,23 @@ def remove_readonly(func, path, excinfo):
         pass
 
 def robust_cleanup(dir_path):
-    """
-    Aggressively tries to clean up the directory, handling Windows file locks.
-    """
-    # 1. Force Garbage Collection to release file handles
-    gc.collect()
-    
+    gc.collect() # Release file handles
     if os.path.exists(dir_path):
-        # 2. Try standard deletion with permission fix
         try:
             shutil.rmtree(dir_path, onerror=remove_readonly)
         except PermissionError:
-            # 3. If failed, wait 1 second and try again (Windows lag)
             time.sleep(1.0)
             try:
                 shutil.rmtree(dir_path, onerror=remove_readonly)
             except Exception as e:
-                st.error(f"⚠️ Could not delete existing artifacts. Please close any other apps using '{dir_path}' and try again.")
+                st.error(f"⚠️ Locked file error. Please close any open apps using '{dir_path}'")
                 raise e
 
 # ==========================================
-# UI & HELPER TEXT
+# UI
 # ==========================================
 st.title("🛠️ Local Data Preprocessor")
-st.markdown("""
-### Instructions
-1. **Close `app.py`** if it is currently running (it locks the database files).
-2. Upload your CSV below.
-3. This tool will overwrite `deploy_artifacts` with fresh data.
-""")
+st.markdown("Upload your CSV. We will brute-force the encoding to make it work.")
 
 # ==========================================
 # PROCESSING LOGIC
@@ -77,40 +61,52 @@ def process_data(uploaded_file):
     status_container = st.status("🚀 Processing started...", expanded=True)
 
     try:
-        # 1. CLEANUP OLD ARTIFACTS
+        # 1. SETUP
         status_container.write("🧹 Cleaning up old artifacts...")
         robust_cleanup(ARTIFACTS_DIR)
         os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
-        # 2. SAVE TEMP FILE
-        status_container.write("💾 Saving temporary file to disk...")
+        status_container.write("💾 Saving temporary file...")
         with open(TEMP_CSV_PATH, "wb") as f:
             f.write(uploaded_file.getbuffer())
         
-        # Connect to DuckDB
         conn = duckdb.connect()
-
-        # 3. CONVERT TO PARQUET (With Encoding Fallback)
-        status_container.write("📦 Converting CSV to optimized Parquet format...")
         parquet_path = os.path.join(ARTIFACTS_DIR, "data.parquet")
-        
-        try:
-            conn.execute(f"""
-                COPY (SELECT * FROM read_csv_auto('{TEMP_CSV_PATH}', sample_size=20000)) 
-                TO '{parquet_path}' (FORMAT 'PARQUET', CODEC 'ZSTD')
-            """)
-        except Exception as e:
-            if "Invalid Input Error" in str(e) or "unicode" in str(e).lower():
-                status_container.write("⚠️ UTF-8 failed. Retrying with Latin-1 encoding...")
-                conn.execute(f"""
-                    COPY (SELECT * FROM read_csv_auto('{TEMP_CSV_PATH}', sample_size=20000, encoding='latin-1', ignore_errors=true)) 
-                    TO '{parquet_path}' (FORMAT 'PARQUET', CODEC 'ZSTD')
-                """)
-            else:
-                raise e
 
-        # 4. EXTRACT METADATA
-        status_container.write("🔍 Extracting schema and statistics...")
+        # 2. CONVERT TO PARQUET (BRUTE FORCE ENCODING STRATEGY)
+        status_container.write("📦 Converting CSV to Parquet...")
+        
+        conversion_success = False
+        last_error = ""
+
+        # List of strategies to try in order
+        strategies = [
+            ("UTF-8 (Auto)", f"COPY (SELECT * FROM read_csv_auto('{TEMP_CSV_PATH}', sample_size=20000)) TO '{parquet_path}' (FORMAT 'PARQUET', CODEC 'ZSTD')"),
+            ("Latin-1", f"COPY (SELECT * FROM read_csv_auto('{TEMP_CSV_PATH}', sample_size=20000, encoding='latin-1')) TO '{parquet_path}' (FORMAT 'PARQUET', CODEC 'ZSTD')"),
+            ("UTF-16", f"COPY (SELECT * FROM read_csv_auto('{TEMP_CSV_PATH}', sample_size=20000, encoding='utf-16')) TO '{parquet_path}' (FORMAT 'PARQUET', CODEC 'ZSTD')"),
+            ("Nuclear Option (Ignore Errors)", f"COPY (SELECT * FROM read_csv_auto('{TEMP_CSV_PATH}', sample_size=20000, encoding='latin-1', ignore_errors=true)) TO '{parquet_path}' (FORMAT 'PARQUET', CODEC 'ZSTD')")
+        ]
+
+        for name, query in strategies:
+            try:
+                # Check if parquet already exists from previous loop and remove it
+                if os.path.exists(parquet_path):
+                    os.remove(parquet_path)
+                
+                conn.execute(query)
+                status_container.write(f"✅ Success using **{name}** encoding!")
+                conversion_success = True
+                break # Stop trying if it works
+            except Exception as e:
+                last_error = str(e)
+                status_container.write(f"⚠️ {name} failed, trying next strategy...")
+                continue
+
+        if not conversion_success:
+            raise Exception(f"All encoding strategies failed. Last error: {last_error}")
+
+        # 3. EXTRACT METADATA
+        status_container.write("🔍 Extracting schema...")
         total_rows = conn.execute(f"SELECT COUNT(*) FROM '{parquet_path}'").fetchone()[0]
         schema_df = conn.execute(f"DESCRIBE SELECT * FROM '{parquet_path}'").df()
         
@@ -122,24 +118,23 @@ def process_data(uploaded_file):
             col_name = row['column_name']
             col_type = row['column_type']
             
-            # Explicit cast to VARCHAR to handle mixed types safely
-            sample_vals = conn.execute(f"""
-                SELECT "{col_name}"::VARCHAR FROM '{parquet_path}' 
-                WHERE "{col_name}" IS NOT NULL LIMIT 3
-            """).fetchall()
-            samples = [str(x[0]) for x in sample_vals]
-            
+            # Safe sampling
+            try:
+                sample_vals = conn.execute(f"""
+                    SELECT "{col_name}"::VARCHAR FROM '{parquet_path}' 
+                    WHERE "{col_name}" IS NOT NULL LIMIT 3
+                """).fetchall()
+                samples = [str(x[0]) for x in sample_vals]
+            except:
+                samples = ["Could not sample"]
+
             desc = (
                 f"Column Name: {col_name}\n"
                 f"Data Type: {col_type}\n"
                 f"Sample Values: {', '.join(samples)}"
             )
             
-            columns_meta.append({
-                "name": col_name,
-                "type": col_type,
-                "description": desc
-            })
+            columns_meta.append({"name": col_name, "type": col_type, "description": desc})
             progress_bar.progress((idx + 1) / total_cols)
 
         # Save Metadata
@@ -147,16 +142,13 @@ def process_data(uploaded_file):
         with open(os.path.join(ARTIFACTS_DIR, "metadata.json"), "w") as f:
             json.dump(metadata, f, indent=2)
 
-        # 5. BUILD VECTOR STORE
-        status_container.write("🧠 Building local Vector Store (Embeddings)...")
+        # 4. VECTOR STORE
+        status_container.write("🧠 Building embeddings...")
         chroma_path = os.path.join(ARTIFACTS_DIR, "chroma_db")
-        
-        # Initialize Client
         client = chromadb.PersistentClient(path=chroma_path)
         collection = client.create_collection("dataset_schema")
         
         model = SentenceTransformer('all-MiniLM-L6-v2')
-        
         documents = [c["description"] for c in columns_meta]
         ids = [c["name"] for c in columns_meta]
         embeddings = model.encode(documents).tolist()
@@ -168,39 +160,25 @@ def process_data(uploaded_file):
             metadatas=[{"name": c["name"], "type": c["type"]} for c in columns_meta]
         )
 
-        # 6. CLEANUP & CLOSE
-        # Crucial for Windows: Close DuckDB and remove temp file
+        # 5. CLEANUP
         conn.close()
-        
-        # Force Client to release handles (best effort for Chroma)
-        del client 
+        del client
         del collection
         gc.collect()
-
-        if os.path.exists(TEMP_CSV_PATH):
-            try: os.remove(TEMP_CSV_PATH)
-            except: pass # Non-critical if temp file stays
-            
-        status_container.update(label="✅ Processing Complete!", state="complete", expanded=False)
         
-        st.success(f"Success! Artifacts saved to `/{ARTIFACTS_DIR}`")
-        st.info("👉 You can now run `streamlit run app.py`")
+        status_container.update(label="✅ Processing Complete!", state="complete", expanded=False)
+        st.success(f"Artifacts ready in `/{ARTIFACTS_DIR}`")
+        st.info("Run `streamlit run app.py` now.")
 
     except Exception as e:
-        status_container.update(label="❌ Error", state="error")
-        st.error(f"An error occurred: {str(e)}")
-        # Clean up connection on error
+        status_container.update(label="❌ Critical Error", state="error")
+        st.error(f"Details: {str(e)}")
         try: conn.close()
         except: pass
 
 # ==========================================
-# MAIN INTERFACE
+# MAIN
 # ==========================================
-uploaded_file = st.file_uploader("Upload a CSV file", type=["csv"])
-
-if uploaded_file:
-    st.write(f"**Filename:** {uploaded_file.name}")
-    st.write(f"**Size:** {uploaded_file.size / (1024*1024):.2f} MB")
-    
-    if st.button("🚀 Process & Generate Artifacts"):
-        process_data(uploaded_file)
+uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
+if uploaded_file and st.button("🚀 Process"):
+    process_data(uploaded_file)
