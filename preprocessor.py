@@ -7,6 +7,7 @@
 
 import streamlit as st
 import duckdb
+import pandas as pd
 import json
 import os
 import shutil
@@ -21,6 +22,7 @@ import time
 # ==========================================
 ARTIFACTS_DIR = "deploy_artifacts"
 TEMP_CSV_PATH = "temp_upload.csv"
+CLEAN_CSV_PATH = "temp_clean.csv" # Intermediate file for broken CSVs
 
 st.set_page_config(page_title="🛠️ Data Preprocessor", layout="centered")
 
@@ -35,7 +37,7 @@ def remove_readonly(func, path, excinfo):
         pass
 
 def robust_cleanup(dir_path):
-    gc.collect() # Release file handles
+    gc.collect()
     if os.path.exists(dir_path):
         try:
             shutil.rmtree(dir_path, onerror=remove_readonly)
@@ -46,12 +48,12 @@ def robust_cleanup(dir_path):
             except Exception as e:
                 st.error(f"⚠️ Locked file error. Please close any open apps using '{dir_path}'")
                 raise e
-
-# ==========================================
-# UI
-# ==========================================
-st.title("🛠️ Local Data Preprocessor")
-st.markdown("Upload your CSV. We will brute-force the encoding to make it work.")
+    
+    # Clean up temp files
+    for f in [TEMP_CSV_PATH, CLEAN_CSV_PATH]:
+        if os.path.exists(f):
+            try: os.remove(f)
+            except: pass
 
 # ==========================================
 # PROCESSING LOGIC
@@ -62,7 +64,7 @@ def process_data(uploaded_file):
 
     try:
         # 1. SETUP
-        status_container.write("🧹 Cleaning up old artifacts...")
+        status_container.write("🧹 Cleaning up workspace...")
         robust_cleanup(ARTIFACTS_DIR)
         os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
@@ -73,37 +75,62 @@ def process_data(uploaded_file):
         conn = duckdb.connect()
         parquet_path = os.path.join(ARTIFACTS_DIR, "data.parquet")
 
-        # 2. CONVERT TO PARQUET (BRUTE FORCE ENCODING STRATEGY)
+        # 2. CONVERT TO PARQUET (BRUTE FORCE + SANITIZATION FALLBACK)
         status_container.write("📦 Converting CSV to Parquet...")
         
         conversion_success = False
         last_error = ""
 
-        # List of strategies to try in order
+        # STRATEGY A: DUCKDB DIRECT (FAST)
         strategies = [
             ("UTF-8 (Auto)", f"COPY (SELECT * FROM read_csv_auto('{TEMP_CSV_PATH}', sample_size=20000)) TO '{parquet_path}' (FORMAT 'PARQUET', CODEC 'ZSTD')"),
             ("Latin-1", f"COPY (SELECT * FROM read_csv_auto('{TEMP_CSV_PATH}', sample_size=20000, encoding='latin-1')) TO '{parquet_path}' (FORMAT 'PARQUET', CODEC 'ZSTD')"),
-            ("UTF-16", f"COPY (SELECT * FROM read_csv_auto('{TEMP_CSV_PATH}', sample_size=20000, encoding='utf-16')) TO '{parquet_path}' (FORMAT 'PARQUET', CODEC 'ZSTD')"),
-            ("Nuclear Option (Ignore Errors)", f"COPY (SELECT * FROM read_csv_auto('{TEMP_CSV_PATH}', sample_size=20000, encoding='latin-1', ignore_errors=true)) TO '{parquet_path}' (FORMAT 'PARQUET', CODEC 'ZSTD')")
+            ("Ignore Errors", f"COPY (SELECT * FROM read_csv_auto('{TEMP_CSV_PATH}', sample_size=20000, encoding='latin-1', ignore_errors=true)) TO '{parquet_path}' (FORMAT 'PARQUET', CODEC 'ZSTD')")
         ]
 
         for name, query in strategies:
             try:
-                # Check if parquet already exists from previous loop and remove it
-                if os.path.exists(parquet_path):
-                    os.remove(parquet_path)
-                
+                if os.path.exists(parquet_path): os.remove(parquet_path)
                 conn.execute(query)
-                status_container.write(f"✅ Success using **{name}** encoding!")
+                status_container.write(f"✅ Success using **{name}** strategy!")
                 conversion_success = True
-                break # Stop trying if it works
+                break
             except Exception as e:
                 last_error = str(e)
-                status_container.write(f"⚠️ {name} failed, trying next strategy...")
                 continue
 
+        # STRATEGY B: PANDAS SANITIZATION (SLOW BUT ROBUST)
         if not conversion_success:
-            raise Exception(f"All encoding strategies failed. Last error: {last_error}")
+            status_container.write("⚠️ SQL engines failed. Sanitizing file with Pandas...")
+            try:
+                # 1. Read with Pandas (Handles bad lines/encoding better)
+                chunk_size = 50000
+                first_chunk = True
+                
+                # We read the messy file and write a CLEAN csv
+                with pd.read_csv(
+                    TEMP_CSV_PATH, 
+                    chunksize=chunk_size, 
+                    encoding_errors='replace', 
+                    on_bad_lines='skip'
+                ) as reader:
+                    for chunk in reader:
+                        # Normalize columns
+                        chunk.columns = chunk.columns.astype(str).str.strip().str.replace('"', '')
+                        
+                        mode = 'w' if first_chunk else 'a'
+                        header = first_chunk
+                        chunk.to_csv(CLEAN_CSV_PATH, mode=mode, header=header, index=False)
+                        first_chunk = False
+                
+                # 2. Convert Clean CSV to Parquet using DuckDB
+                conn.execute(f"COPY (SELECT * FROM read_csv_auto('{CLEAN_CSV_PATH}')) TO '{parquet_path}' (FORMAT 'PARQUET', CODEC 'ZSTD')")
+                
+                status_container.write("✅ Success using **Pandas Sanitization**!")
+                conversion_success = True
+                
+            except Exception as e:
+                raise Exception(f"File is unrecognizable as CSV. Error: {str(e)}")
 
         # 3. EXTRACT METADATA
         status_container.write("🔍 Extracting schema...")
@@ -118,7 +145,6 @@ def process_data(uploaded_file):
             col_name = row['column_name']
             col_type = row['column_type']
             
-            # Safe sampling
             try:
                 sample_vals = conn.execute(f"""
                     SELECT "{col_name}"::VARCHAR FROM '{parquet_path}' 
@@ -126,14 +152,9 @@ def process_data(uploaded_file):
                 """).fetchall()
                 samples = [str(x[0]) for x in sample_vals]
             except:
-                samples = ["Could not sample"]
+                samples = ["N/A"]
 
-            desc = (
-                f"Column Name: {col_name}\n"
-                f"Data Type: {col_type}\n"
-                f"Sample Values: {', '.join(samples)}"
-            )
-            
+            desc = (f"Column: {col_name}\nType: {col_type}\nSamples: {', '.join(samples)}")
             columns_meta.append({"name": col_name, "type": col_type, "description": desc})
             progress_bar.progress((idx + 1) / total_cols)
 
@@ -168,7 +189,6 @@ def process_data(uploaded_file):
         
         status_container.update(label="✅ Processing Complete!", state="complete", expanded=False)
         st.success(f"Artifacts ready in `/{ARTIFACTS_DIR}`")
-        st.info("Run `streamlit run app.py` now.")
 
     except Exception as e:
         status_container.update(label="❌ Critical Error", state="error")
