@@ -5,3 +5,4 @@ openai
 chromadb
 sentence-transformers
 pyarrow
+pysqlite3-binary
