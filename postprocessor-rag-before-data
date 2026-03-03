@@ -1,182 +1,279 @@
+# ==========================================
+# 🤖 POSTPROCESSOR (CHAT INTERFACE) - V12 (Safe Launcher)
+# ==========================================
+# UPDATES:
+#   1. Architecture: Implements "Launcher" state.
+#   2. Safety: User must "Connect" to lock in the folder before chatting.
+#   3. Stability: Prevents Windows file-locking errors by stopping hot-swapping.
+# ==========================================
+
 import streamlit as st
+
+# --- SQLITE FIX FOR STREAMLIT CLOUD ---
+try:
+    __import__('pysqlite3')
+    import sys
+    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+except ImportError:
+    pass
+# --------------------------------------
+
 import duckdb
 import chromadb
 import json
 import os
 from openai import OpenAI
+import datetime
+import pandas as pd
+
+st.set_page_config(page_title="🤖 CSV RAG Chat", layout="wide")
 
 # ==========================================
-# CONFIGURATION
+# SESSION STATE SETUP
 # ==========================================
-ARTIFACTS_DIR = "deploy_artifacts"
-PARQUET_FILE = os.path.join(ARTIFACTS_DIR, "data.parquet")
-METADATA_FILE = os.path.join(ARTIFACTS_DIR, "metadata.json")
-CHROMA_PATH = os.path.join(ARTIFACTS_DIR, "chroma_db")
-
-# Page Config
-st.set_page_config(page_title="Large Data RAG PoC", layout="wide")
+if "data_active" not in st.session_state:
+    st.session_state.data_active = False
+if "messages" not in st.session_state:
+    st.session_state.messages = [{"role": "assistant", "content": "Hello! I'm ready to analyze your data."}]
+if "active_path" not in st.session_state:
+    st.session_state.active_path = "deploy_artifacts"
+if "api_key" not in st.session_state:
+    st.session_state.api_key = ""
 
 # ==========================================
-# HELPER FUNCTIONS
+# SIDEBAR (LAUNCHER UI)
 # ==========================================
-@st.cache_resource
-def load_resources():
-    """
-    Loads connections once to save resources.
-    """
-    if not os.path.exists(PARQUET_FILE):
-        return None, None, None
-
-    # 1. Load Metadata
-    with open(METADATA_FILE, "r") as f:
-        metadata = json.load(f)
-
-    # 2. Connect to ChromaDB
-    chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-    collection = chroma_client.get_collection("dataset_schema")
-
-    # 3. DuckDB Connection (Read-only for safety)
-    # We don't load data; we just point to the Parquet file
-    conn = duckdb.connect(database=':memory:', read_only=False)
+with st.sidebar:
+    st.title("🤖 Data Assistant")
     
-    return metadata, collection, conn
+    # 1. API KEY HANDLING
+    # Check secrets first
+    try:
+        if "OPENAI_API_KEY" in st.secrets:
+            st.session_state.api_key = st.secrets["OPENAI_API_KEY"]
+            st.success("🔑 API Key loaded from Secrets")
+    except: pass
+    
+    # If not in secrets, ask user (only if not active yet)
+    if not st.session_state.api_key:
+        st.session_state.api_key = st.text_input("OpenAI API Key", type="password", disabled=st.session_state.data_active)
 
-def generate_sql_query(question, context, metadata, client_openai):
-    """
-    Uses the LLM to generate a DuckDB SQL query based on the question and schema context.
-    """
-    system_prompt = f"""
-    You are an expert Data Scientist. You are working with a single table.
+    st.markdown("---")
+
+    # 2. FOLDER SELECTION
+    if not st.session_state.data_active:
+        st.write("### 📂 1. Select Data Source")
+        target_dir = st.text_input("Artifacts Folder Path", value=st.session_state.active_path)
+        
+        if st.button("🚀 Connect to Data", type="primary"):
+            if not st.session_state.api_key:
+                st.error("Please enter an API Key first.")
+            elif not os.path.exists(target_dir):
+                st.error("❌ Folder not found.")
+            else:
+                st.session_state.active_path = target_dir
+                st.session_state.data_active = True
+                st.session_state.messages = [{"role": "assistant", "content": f"Connected to `{target_dir}`. Ask me anything!"}]
+                st.rerun()
+    else:
+        st.write("### ✅ Data Connected")
+        st.success(f"Source: `{st.session_state.active_path}`")
+        
+        if st.button("🔄 Switch Dataset"):
+            st.session_state.data_active = False
+            st.rerun()
+
+    # --- PRIVACY BLURB ---
+    st.markdown("---")
+    st.info("""
+    🔒 **Privacy & Security**
     
-    IMPORTANT: You must query the parquet file directly using this syntax:
-    SELECT ... FROM '{PARQUET_FILE}' ...
+    Your data is stored in **Binary Parquet**. 
+    The AI model *only* views the schema (column names). 
+    **Raw data rows are never sent to the LLM.**
+    """)
+    # ---------------------
+
+# ==========================================
+# HELPERS
+# ==========================================
+@st.cache_resource(show_spinner="Loading resources...")
+def load_resources(path):
+    if not os.path.exists(path): return None, None, None
+    data_exists = False
+    try:
+        for f in os.listdir(path):
+            if f.endswith(".parquet"):
+                data_exists = True; break
+    except: return None, None, None
+    if not data_exists: return None, None, None
+
+    try:
+        with open(os.path.join(path, "metadata.json"), "r") as f: metadata = json.load(f)
+        chroma_client = chromadb.PersistentClient(path=os.path.join(path, "chroma_db"))
+        collection = chroma_client.get_collection("dataset_schema")
+        return metadata, collection
+    except: return None, None, None
+
+def get_sql_query(question, context, metadata, client, artifacts_path):
+    today = datetime.date.today().strftime("%Y-%m-%d")
     
-    The dataset has {metadata['total_rows']} rows.
+    table_list = []
+    if 'tables' in metadata:
+        for t_name, t_info in metadata['tables'].items():
+            f_pattern = os.path.join(artifacts_path, t_info['file_pattern']).replace("\\", "/")
+            table_list.append(f"- Table: '{t_name}' -> File: '{f_pattern}'")
+    else:
+        f_pattern = os.path.join(artifacts_path, "data_*.parquet").replace("\\", "/")
+        table_list.append(f"- Table: 'data' -> File: '{f_pattern}'")
+
+    table_inventory = "\n".join(table_list)
     
-    Here is the schema information relevant to the user's question:
+    prompt = f"""
+    You are an expert DuckDB SQL Analyst.
+    Current Date: {today}
+    
+    AVAILABLE TABLES:
+    {table_inventory}
+    
+    RELEVANT COLUMNS FOUND:
     {context}
     
-    Rules:
-    1. Return ONLY the SQL query. No markdown, no explanations.
-    2. Use DuckDB dialect (e.g. date_part('year', date_col) instead of YEAR(date_col)).
-    3. If the user asks for a specific text match, use ILIKE for case insensitivity.
-    4. Limit results to 50 unless specified otherwise.
+    USER QUESTION: 
+    "{question}"
+    
+    STRICT RULES:
+    1. Output ONLY valid SQL. No markdown.
+    2. SYNTAX: Use `read_parquet('path/to/pattern')` for FROM clauses.
+    3. JOINS: If multiple tables exist, join them on common keys.
+    4. DATE LOGIC: Check context for best date column.
+    5. AGGREGATION: Enforce GROUP BY when mixing aggregates.
+    6. LIMIT: Default to 50 unless specified.
+    7. SCHEMA: If asked for "columns", use `DESCRIBE SELECT * FROM ...`
+    8. FUZZY SEARCH: Use `ILIKE '%term%'`.
+    9. SAFE DIVISION: Use `CASE WHEN Denom = 0 THEN 0 ELSE Num/Denom END`.
+    10. NULLS: Exclude NULLs.
+    11. ORDERING: Top/Best = `DESC`.
+    12. DISTINCT: `COUNT(DISTINCT col)`.
+    13. DATE GROUPING: Use `date_trunc`.
+    14. CASTING: Cast integers to `DOUBLE` for division.
     """
     
-    response = client_openai.chat.completions.create(
-        model="gpt-3.5-turbo", # Use gpt-4-turbo for better SQL generation
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": question}
-        ],
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "system", "content": "You are a SQL generator."},
+                  {"role": "user", "content": prompt}],
         temperature=0
     )
     return response.choices[0].message.content.strip().replace("```sql", "").replace("```", "")
 
-def summarize_results(question, df, client_openai):
-    """
-    Summarizes the dataframe results back to the user in natural language.
-    """
-    data_csv = df.to_csv(index=False)
+@st.cache_data(show_spinner=False)
+def execute_sql(sql_query):
+    conn = duckdb.connect(database=':memory:', read_only=False)
+    try:
+        df = conn.execute(sql_query).df()
+        return df
+    except Exception as e:
+        raise e
+    finally:
+        conn.close()
+
+def summarize_answer(question, df, client):
+    data_str = df.to_string(index=False)
+    prompt = f"""
+    User Question: {question}
+    SQL Result Data:
+    {data_str}
     
-    response = client_openai.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "You are a helpful analyst. Summarize the data results to answer the user's question concisely."},
-            {"role": "user", "content": f"Question: {question}\n\nData Results:\n{data_csv}"}
-        ]
+    Task: Summarize this answer in plain English. 
+    """
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
     )
     return response.choices[0].message.content
 
-# ==========================================
-# MAIN APP UI
-# ==========================================
-st.title("📊 RAG over Large Datasets (PoC)")
+def attempt_visualization(df):
+    try:
+        if df.empty or len(df.columns) < 2: return
+        num_cols = df.select_dtypes(include=['number']).columns.tolist()
+        date_cols = df.select_dtypes(include=['datetime', 'datetimetz']).columns.tolist()
+        cat_cols = df.select_dtypes(include=['object', 'string', 'category']).columns.tolist()
 
-# Sidebar: Instructions & API Key
-with st.sidebar:
-    st.header("Configuration")
-    api_key = st.text_input("OpenAI API Key", type="password")
-    
-    st.markdown("---")
-    st.markdown("""
-    **How this works:**
-    1. **Local Preprocessing:** We converted a large CSV to Parquet and extracted schema embeddings locally.
-    2. **Vector Search:** We find the columns relevant to your question.
-    3. **SQL Generation:** The LLM writes a SQL query targeting the Parquet file.
-    4. **Execution:** DuckDB executes the query (without loading the full file to RAM).
-    """)
-
-# Check for artifacts
-metadata, collection, conn = load_resources()
-
-if not metadata:
-    st.error(f"Artifacts not found! Did you run `preprocess.py`? Looking in: {ARTIFACTS_DIR}")
-    st.stop()
-
-if not api_key:
-    st.warning("Please enter your OpenAI API Key in the sidebar to continue.")
-    st.stop()
-
-# Initialize OpenAI
-client_openai = OpenAI(api_key=api_key)
-
-# Initialize Chat History
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# Display Chat History
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-# Chat Input
-if prompt := st.chat_input("Ask a question about your data..."):
-    # 1. User Message
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    # 2. RAG Logic
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        
-        try:
-            with st.status("Thinking...", expanded=True) as status:
-                
-                # A. Retrieve Context (Schema RAG)
-                status.write("🔍 Searching dataset schema...")
-                results = collection.query(
-                    query_texts=[prompt],
-                    n_results=5 # Get top 5 most relevant columns
-                )
-                context_text = "\n".join(results['documents'][0])
-                
-                # B. Generate SQL
-                status.write("📝 Generating SQL query...")
-                sql_query = generate_sql_query(prompt, context_text, metadata, client_openai)
-                st.code(sql_query, language="sql") # Show the user the SQL (Transparency)
-                
-                # C. Execute SQL (DuckDB)
-                status.write("⚡ Executing query on Parquet file...")
+        if not date_cols and cat_cols:
+            for c in cat_cols:
                 try:
-                    df = conn.execute(sql_query).df()
-                    st.dataframe(df) # Show the raw data table
-                    
-                    # D. Synthesize Answer
-                    if not df.empty:
-                        status.write("🧠 Summarizing results...")
-                        final_answer = summarize_results(prompt, df, client_openai)
-                    else:
-                        final_answer = " The query returned no results."
-                        
-                except Exception as e:
-                    final_answer = f"I generated a query, but it failed to run. Error: {str(e)}"
-                    status.update(state="error")
+                    converted = pd.to_datetime(df[c], errors='coerce')
+                    if converted.notna().mean() > 0.8:
+                        df[c] = converted
+                        date_cols.append(c)
+                        cat_cols.remove(c)
+                except: pass
 
-            # Output Final Answer
-            message_placeholder.markdown(final_answer)
-            st.session_state.messages.append({"role": "assistant", "content": final_answer})
+        st.caption("📊 Auto-Visualization")
+        
+        if date_cols and num_cols:
+            st.line_chart(df.set_index(date_cols[0])[num_cols[0]])
+            return
 
-        except Exception as e:
-            st.error(f"An error occurred: {str(e)}")
+        if cat_cols and num_cols:
+            if len(df) > 20: df = df.head(20)
+            st.bar_chart(df.set_index(cat_cols[0])[num_cols[0]])
+            return
+
+    except Exception: pass
+
+# ==========================================
+# MAIN APP LOGIC
+# ==========================================
+st.title("🤖 Chat with your Large Dataset")
+
+# 1. IF NOT CONNECTED, STOP HERE
+if not st.session_state.data_active:
+    st.info("👈 Please enter your API Key and connect to a Data Folder in the sidebar.")
+    st.stop()
+
+# 2. LOAD RESOURCES
+client = OpenAI(api_key=st.session_state.api_key)
+res = load_resources(st.session_state.active_path)
+
+if not res:
+    st.error(f"⚠️ Artifacts not found in `{st.session_state.active_path}`.")
+    st.stop()
+
+metadata, collection = res
+
+# 3. CHAT INTERFACE
+for msg in st.session_state.messages: st.chat_message(msg["role"]).write(msg["content"])
+
+if prompt := st.chat_input():
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    st.chat_message("user").write(prompt)
+    
+    with st.chat_message("assistant"):
+        with st.status("Thinking...", expanded=False) as status:
+            try:
+                status.write("🔍 Identifying relevant columns...")
+                results = collection.query(query_texts=[prompt], n_results=5)
+                context = "\n".join(results['documents'][0])
+                
+                status.write("📝 Writing SQL query (gpt-4o-mini)...")
+                sql = get_sql_query(prompt, context, metadata, client, st.session_state.active_path)
+                st.code(sql, language="sql")
+                
+                status.write("⚡ Executing (Cached)...")
+                df = execute_sql(sql)
+                st.dataframe(df)
+                
+                attempt_visualization(df)
+                
+                if not df.empty: answer = summarize_answer(prompt, df, client)
+                else: answer = "No results found."
+                
+                status.update(label="✅ Answer Ready", state="complete")
+                st.write(answer)
+                st.session_state.messages.append({"role": "assistant", "content": answer})
+                
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
+                status.update(label="❌ Failed", state="error")
